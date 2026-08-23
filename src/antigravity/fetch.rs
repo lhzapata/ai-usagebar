@@ -134,7 +134,7 @@ async fn open_session(client: &reqwest::Client) -> Result<Session> {
         ));
     }
 
-    let mut last_err = None;
+    let mut best_err = None;
     for base in bases {
         let csrf = fetch_csrf(client, &base).await;
         match post_rpc(client, &base, csrf.as_deref(), STATUS_RPC).await {
@@ -146,12 +146,55 @@ async fn open_session(client: &reqwest::Client) -> Result<Session> {
                     account: account_key(&v),
                 });
             }
-            Err(e) => last_err = Some(e),
+            Err(e) => best_err = Some(keep_best_err(best_err.take(), e)),
         }
     }
-    Err(last_err.unwrap_or_else(|| {
+    Err(best_err.unwrap_or_else(|| {
         AppError::Other("antigravity: no local server answered GetUserStatus".into())
     }))
+}
+
+/// How much a failed probe actually tells us about the problem.
+///
+/// Ordered least to most diagnostic, so comparing two ranks picks the failure
+/// worth putting in front of the user.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ErrRank {
+    /// Nothing answered: connection refused, timed out, unreachable. Says only
+    /// that this candidate is not the server — which is the expected outcome
+    /// for every candidate but one, so it diagnoses nothing on its own.
+    Silent,
+    /// Something answered over HTTP but the exchange failed: an unexpected
+    /// status, an oversized body, or a payload we could not read.
+    Answered,
+    /// The user has to do something: the session is no longer signed in.
+    Actionable,
+}
+
+fn err_rank(err: &AppError) -> ErrRank {
+    match err {
+        AppError::Http {
+            status: 401 | 403, ..
+        } => ErrRank::Actionable,
+        AppError::Transport(_) => ErrRank::Silent,
+        _ => ErrRank::Answered,
+    }
+}
+
+/// Keep whichever of two probe failures diagnoses the problem better.
+///
+/// Ties go to the failure already held, because [`candidate_bases`] emits
+/// candidates best-first: an explicit override before discovery, and each
+/// process's HTTP listener before the TLS one trailing it. That tie-break is
+/// what stops a trailing candidate from burying the real answer — Go's
+/// `net/http.Server` replies to an unencrypted request on its HTTPS listener
+/// with a generic `400`, which ranks [`ErrRank::Answered`] exactly like a
+/// genuine schema drift and would otherwise overwrite it.
+fn keep_best_err(current: Option<AppError>, candidate: AppError) -> AppError {
+    match current {
+        Some(kept) if err_rank(&kept) >= err_rank(&candidate) => kept,
+        _ => candidate,
+    }
 }
 
 async fn fetch_live(
@@ -387,29 +430,42 @@ fn candidate_bases() -> Vec<String> {
 /// Test seam for [`candidate_bases`] — takes the address override and the
 /// discovered ports instead of reading the environment and `/proc`.
 fn candidate_bases_with(override_addr: Option<&str>, discovered: Vec<u16>) -> Vec<String> {
-    if let Some(addr) = override_addr {
-        let addr = addr.trim();
-        if !addr.is_empty() {
-            return vec![normalize_base(addr)];
-        }
+    let mut bases = Vec::new();
+    if let Some(base) = override_addr.and_then(normalize_base) {
+        bases.push(base);
     }
 
     // No hardcoded fallback port on purpose: the server always binds with
     // `--https_server_port 0`, so its port is drawn from the ephemeral range
     // and cannot be guessed. Probing a fixed one would just poke whatever
-    // unrelated process happens to own it. Discovery or the explicit override.
-    discovered
-        .into_iter()
-        .map(|p| format!("http://127.0.0.1:{p}"))
-        .collect()
+    // unrelated process happens to own it. Discovered ports follow any
+    // explicit override as fallback, with duplicates omitted.
+    for p in discovered {
+        let candidate = format!("http://127.0.0.1:{p}");
+        if !bases.contains(&candidate) {
+            bases.push(candidate);
+        }
+    }
+
+    bases
 }
 
-fn normalize_base(addr: &str) -> String {
-    if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
-    }
+/// Turn a configured address into a base URL: trim surrounding whitespace,
+/// supply the default scheme when it is missing, and drop trailing slashes so
+/// the RPC paths built on top do not come out with a double slash.
+///
+/// Returns `None` when nothing but a scheme survives. `ANTIGRAVITY_LS_ADDRESS`
+/// is user input, and a value like `"/"` carries no authority to connect to;
+/// admitting it as a candidate would spend a probe to learn what is already
+/// knowable here.
+fn normalize_base(addr: &str) -> Option<String> {
+    let trimmed = addr.trim();
+    let (scheme, authority) = match trimmed.split_once("://") {
+        Some((scheme @ ("http" | "https"), rest)) => (scheme, rest),
+        _ => ("http", trimmed),
+    };
+    let authority = authority.trim_end_matches('/');
+    (!authority.is_empty()).then(|| format!("{scheme}://{authority}"))
 }
 
 /// Does this process look like one of the three Antigravity products?
@@ -431,6 +487,55 @@ fn is_antigravity_process(comm: &str, exe: Option<&str>) -> bool {
     })
 }
 
+/// Flatten per-process listener ports into the order they should be probed.
+///
+/// Every Antigravity product binds two loopback ports: a lower-numbered
+/// HTTPS/TLS listener and a higher-numbered HTTP JSON-RPC listener, and only
+/// the latter serves `GetUserStatus` and `RetrieveUserQuotaSummary`. Sending a
+/// plain HTTP request to the TLS one makes Go's `net/http.Server` write a
+/// handshake error to that product's stderr on every poll cycle, so the HTTP
+/// listener wants to be reached first.
+///
+/// Sorting the whole set descending would only get that right for a single
+/// process. The high/low pairing holds *within* a process and says nothing
+/// across them, so with two products running, one product's TLS port can sort
+/// above the other's HTTP port. Each process's ports are therefore sorted
+/// high-to-low and then taken rank by rank: every process's highest port,
+/// then every process's second-highest, and so on. Under the two-port model
+/// that puts all HTTP listeners ahead of all TLS listeners, so a TLS port is
+/// reached only once no HTTP port answered at all.
+///
+/// Order among processes is arbitrary — all three report the same shared
+/// quota, so whichever answers first is authoritative — and pid order is used
+/// only to keep the result reproducible, since `/proc`, `lsof` and the Windows
+/// TCP table each enumerate in their own order.
+///
+/// The rank heuristic is not a guarantee: a process listening on more than two
+/// ports, or one whose two `bind(0)` calls straddle a wrap in the ephemeral
+/// range, can still be probed TLS-first. Nothing breaks when it is — every
+/// discovered port is still probed, and only the stderr line this ordering
+/// exists to avoid comes back.
+#[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn probe_order(per_pid: std::collections::BTreeMap<u32, Vec<u16>>) -> Vec<u16> {
+    let groups: Vec<Vec<u16>> = per_pid
+        .into_values()
+        .map(|mut group| {
+            group.sort_unstable_by(|a, b| b.cmp(a));
+            group
+        })
+        .collect();
+
+    let mut ports: Vec<u16> = Vec::new();
+    for rank in 0..groups.iter().map(Vec::len).max().unwrap_or(0) {
+        for port in groups.iter().filter_map(|group| group.get(rank)) {
+            if !ports.contains(port) {
+                ports.push(*port);
+            }
+        }
+    }
+    ports
+}
+
 /// Loopback ports listened on by any running Antigravity product.
 ///
 /// Reads `/proc` directly rather than shelling out to `ss`/`lsof`: find the
@@ -439,14 +544,23 @@ fn is_antigravity_process(comm: &str, exe: Option<&str>) -> bool {
 /// shared quota, so whichever answers first is authoritative.
 #[cfg(target_os = "linux")]
 fn discover_ls_ports() -> Vec<u16> {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashMap};
 
-    let mut inodes: HashSet<u64> = HashSet::new();
+    // Socket inode -> owning pid, so the ports found in `/proc/net` can be
+    // grouped back per process for `probe_order`.
+    let mut owners: HashMap<u64, u32> = HashMap::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
     for entry in entries.flatten() {
         let pid_dir = entry.path();
+        let Some(pid) = pid_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
         let Ok(comm) = std::fs::read_to_string(pid_dir.join("comm")) else {
             continue;
         };
@@ -467,30 +581,29 @@ fn discover_ls_ports() -> Vec<u16> {
                 .and_then(|s| s.strip_suffix(']'))
                 .and_then(|s| s.parse::<u64>().ok())
             {
-                inodes.insert(ino);
+                owners.insert(ino, pid);
             }
         }
     }
 
-    if inodes.is_empty() {
+    if owners.is_empty() {
         return Vec::new();
     }
 
-    let mut ports = Vec::new();
+    let mut per_pid: BTreeMap<u32, Vec<u16>> = BTreeMap::new();
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let Ok(contents) = std::fs::read_to_string(table) else {
             continue;
         };
         for line in contents.lines().skip(1) {
             if let Some((port, ino)) = parse_proc_net_line(line)
-                && inodes.contains(&ino)
-                && !ports.contains(&port)
+                && let Some(&pid) = owners.get(&ino)
             {
-                ports.push(port);
+                per_pid.entry(pid).or_default().push(port);
             }
         }
     }
-    ports
+    probe_order(per_pid)
 }
 
 /// macOS has no `/proc`, so fall back to `lsof` (present on every macOS
@@ -514,27 +627,35 @@ fn discover_ls_ports() -> Vec<u16> {
 }
 
 /// Pure parser for `lsof -F pcn` output, kept separate from process spawning
-/// so the parsing logic is unit-testable without shelling out.
-#[cfg(target_os = "macos")]
+/// so the parsing logic is unit-testable without shelling out. Compiled under
+/// `test` on every platform, like [`matching_windows_ports`], so its tests are
+/// not macOS-only.
+#[cfg(any(test, target_os = "macos"))]
 fn parse_lsof_pcn(output: &str) -> Vec<u16> {
-    let mut ports = Vec::new();
-    let mut current_matches = false;
+    let mut per_pid: std::collections::BTreeMap<u32, Vec<u16>> = std::collections::BTreeMap::new();
+    // The pid arrives on the `p` line and the command name on the `c` line
+    // right after it, so hold the pid until the name confirms it is ours.
+    let mut pid = None;
+    let mut owner = None;
     for line in output.lines() {
         let Some(rest) = line.get(1..) else { continue };
         match line.as_bytes().first() {
-            Some(b'p') => current_matches = false,
-            Some(b'c') => current_matches = is_antigravity_process(rest, None),
-            Some(b'n') if current_matches => {
-                if let Some(port) = rest.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
-                    && !ports.contains(&port)
+            Some(b'p') => {
+                pid = rest.parse::<u32>().ok();
+                owner = None;
+            }
+            Some(b'c') => owner = pid.filter(|_| is_antigravity_process(rest, None)),
+            Some(b'n') => {
+                if let Some(pid) = owner
+                    && let Some(port) = rest.rsplit(':').next().and_then(|p| p.parse::<u16>().ok())
                 {
-                    ports.push(port);
+                    per_pid.entry(pid).or_default().push(port);
                 }
             }
             _ => {}
         }
     }
-    ports
+    probe_order(per_pid)
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -560,20 +681,24 @@ fn matching_windows_process_ids(processes: &[(u32, String)]) -> std::collections
         .collect()
 }
 
+/// Loopback ports owned by the matching processes, grouped per pid and handed
+/// to [`probe_order`].
 #[cfg(any(test, target_os = "windows"))]
 fn matching_windows_ports(
     pids: &std::collections::HashSet<u32>,
     rows: &[WindowsTcpRow],
 ) -> Vec<u16> {
-    rows.iter()
-        .filter(|row| pids.contains(&row.pid) && row.local_addr == [127, 0, 0, 1])
-        .filter_map(|row| {
-            let port = u16::from_be((row.local_port & u32::from(u16::MAX)) as u16);
-            (port != 0).then_some(port)
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    let mut per_pid: std::collections::BTreeMap<u32, Vec<u16>> = std::collections::BTreeMap::new();
+    for row in rows {
+        if !pids.contains(&row.pid) || row.local_addr != [127, 0, 0, 1] {
+            continue;
+        }
+        let port = u16::from_be((row.local_port & u32::from(u16::MAX)) as u16);
+        if port != 0 {
+            per_pid.entry(row.pid).or_default().push(port);
+        }
+    }
+    probe_order(per_pid)
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -1320,10 +1445,31 @@ mod tests {
     }
 
     #[test]
-    fn explicit_address_wins_and_gets_a_scheme() {
+    fn explicit_address_comes_first_and_gets_a_scheme() {
         assert_eq!(
             candidate_bases_with(Some("127.0.0.1:1234"), vec![5678]),
-            vec!["http://127.0.0.1:1234".to_string()]
+            vec![
+                "http://127.0.0.1:1234".to_string(),
+                "http://127.0.0.1:5678".to_string(),
+            ]
+        );
+        // Trailing slashes are trimmed.
+        assert_eq!(
+            candidate_bases_with(Some("127.0.0.1:1234/"), vec![5678]),
+            vec![
+                "http://127.0.0.1:1234".to_string(),
+                "http://127.0.0.1:5678".to_string(),
+            ]
+        );
+        // Duplicate base URL is omitted.
+        assert_eq!(
+            candidate_bases_with(Some("127.0.0.1:5678"), vec![5678]),
+            vec!["http://127.0.0.1:5678".to_string()]
+        );
+        // Duplicate discovered ports are omitted.
+        assert_eq!(
+            candidate_bases_with(None, vec![5678, 5678]),
+            vec!["http://127.0.0.1:5678".to_string()]
         );
         // An address that already carries a scheme is left alone.
         assert_eq!(
@@ -1450,7 +1596,137 @@ mod tests {
                 pid: 10,
             },
         ];
-        assert_eq!(matching_windows_ports(&pids, &rows), vec![59868, 59870]);
+        assert_eq!(matching_windows_ports(&pids, &rows), vec![59870, 59868]);
+    }
+
+    /// Antigravity 2.0 and an interactive `agy` session at the same time. Their
+    /// port pairs must not be flattened into one set: sorting all four
+    /// descending would put pid 20's TLS listener ahead of pid 10's HTTP one.
+    #[test]
+    fn windows_ports_from_two_products_keep_tls_listeners_last() {
+        let pids = std::collections::HashSet::from([10, 20]);
+        let row = |port: u16, pid: u32| WindowsTcpRow {
+            local_addr: [127, 0, 0, 1],
+            local_port: u32::from(port.to_be()),
+            pid,
+        };
+        let rows = [
+            row(40000, 10),
+            row(40001, 10),
+            row(50000, 20),
+            row(50001, 20),
+        ];
+        assert_eq!(
+            matching_windows_ports(&pids, &rows),
+            vec![40001, 50001, 40000, 50000]
+        );
+    }
+
+    /// The probe order is what makes "keep the earliest failure at a rank" a
+    /// safe tie-break in [`keep_best_err`]: the ports most likely to answer go
+    /// out first, so a trailing candidate's generic failure never displaces a
+    /// real diagnosis.
+    #[test]
+    fn probe_order_puts_every_http_listener_ahead_of_every_tls_listener() {
+        use std::collections::BTreeMap;
+
+        // One process, the ordinary case: HTTP (higher) before TLS (lower).
+        assert_eq!(
+            probe_order(BTreeMap::from([(10, vec![59868, 59870])])),
+            vec![59870, 59868]
+        );
+        // Two products. A plain descending sort would yield 50001, 50000,
+        // 40001, 40000 and touch pid 20's TLS listener second; taking the
+        // ports rank by rank keeps both TLS listeners at the back, where they
+        // are reached only if no HTTP listener answered.
+        assert_eq!(
+            probe_order(BTreeMap::from([
+                (10, vec![40000, 40001]),
+                (20, vec![50000, 50001]),
+            ])),
+            vec![40001, 50001, 40000, 50000]
+        );
+        // Uneven groups: the extra port of the deeper group trails everything
+        // it ranks below, and a port claimed by two pids is probed once.
+        assert_eq!(
+            probe_order(BTreeMap::from([
+                (10, vec![6000, 5000, 4000]),
+                (20, vec![6000, 7000]),
+            ])),
+            vec![6000, 7000, 5000, 4000]
+        );
+        assert!(probe_order(BTreeMap::new()).is_empty());
+    }
+
+    /// A failed probe is only worth showing the user if it says more than
+    /// "nothing here". Most candidates are expected to fail, and the TLS
+    /// listener trailing each process answers an unencrypted request with a
+    /// bare `400` — without a rank it would bury the real diagnosis from the
+    /// port that actually speaks JSON-RPC.
+    #[test]
+    fn the_most_diagnostic_probe_failure_is_the_one_kept() {
+        let refused = || AppError::Transport("connection refused (os error 111)".into());
+        let tls_400 = || AppError::Http {
+            status: 400,
+            body: "Client sent an HTTP request to an HTTPS server".into(),
+        };
+        let drift = || AppError::Schema("quota summary has no buckets".into());
+        let expired = || AppError::Http {
+            status: 401,
+            body: "token expired".into(),
+        };
+
+        // Anything that answered beats a silent candidate, in either order.
+        assert!(matches!(
+            keep_best_err(Some(refused()), drift()),
+            AppError::Schema(_)
+        ));
+        assert!(matches!(
+            keep_best_err(Some(drift()), refused()),
+            AppError::Schema(_)
+        ));
+        // An auth failure outranks both: it is the only one the user can act on.
+        assert!(matches!(
+            keep_best_err(Some(drift()), expired()),
+            AppError::Http { status: 401, .. }
+        ));
+        assert!(matches!(
+            keep_best_err(Some(expired()), drift()),
+            AppError::Http { status: 401, .. }
+        ));
+        // Same rank, so the earlier candidate holds: the drift seen on the
+        // JSON-RPC port survives the 400 from the TLS port probed after it.
+        assert!(matches!(
+            keep_best_err(Some(drift()), tls_400()),
+            AppError::Schema(_)
+        ));
+        assert!(matches!(
+            keep_best_err(None, refused()),
+            AppError::Transport(_)
+        ));
+
+        // Folded over the whole sequence a two-product machine produces —
+        // both HTTP listeners, then both TLS listeners — the drift is what
+        // reaches the tooltip.
+        let kept = [drift(), refused(), tls_400(), tls_400()]
+            .into_iter()
+            .fold(None, |best, err| Some(keep_best_err(best, err)));
+        assert!(matches!(kept, Some(AppError::Schema(_))));
+    }
+
+    /// `ANTIGRAVITY_LS_ADDRESS` is user input. An entry that leaves no
+    /// authority to connect to is dropped instead of probed, so it can neither
+    /// spend a round trip nor contribute a failure competing with the real one.
+    #[test]
+    fn an_override_with_no_authority_is_dropped_not_probed() {
+        for junk in ["/", "///", "http://", "https://", "  /  "] {
+            assert_eq!(
+                candidate_bases_with(Some(junk), vec![4242]),
+                vec!["http://127.0.0.1:4242".to_string()],
+                "{junk:?} should not survive as a candidate"
+            );
+        }
+        assert!(candidate_bases_with(Some("/"), vec![]).is_empty());
     }
 
     #[test]
@@ -1518,23 +1794,36 @@ mod tests {
         assert!(parse_windows_tcp_rows(&buffer, used - 1).is_empty());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn lsof_parser_keeps_only_ports_owned_by_antigravity_processes() {
         // `agy` (pid 74101) has three listening sockets; `sshd` (pid 200) has
         // one that must be excluded even though it sorts right after `c`.
         let output = "p74101\ncagy\nf10\nn127.0.0.1:8829\nf11\nn127.0.0.1:61289\nf12\nn127.0.0.1:61290\np200\ncsshd\nf5\nn*:22\n";
-        assert_eq!(parse_lsof_pcn(output), vec![8829, 61289, 61290]);
+        assert_eq!(parse_lsof_pcn(output), vec![61290, 61289, 8829]);
     }
 
-    #[cfg(target_os = "macos")]
+    /// The pid on each `p` line has to survive to the `n` lines, or the ports
+    /// of two running products collapse into one group and rank ordering can
+    /// no longer keep the TLS listeners last.
+    #[test]
+    fn lsof_parser_keeps_each_products_ports_in_its_own_group() {
+        let output = concat!(
+            "p100\ncagy\nf3\nn127.0.0.1:40000\nf4\nn127.0.0.1:40001\n",
+            "p200\nclanguage_server\nf5\nn127.0.0.1:50000\nf6\nn127.0.0.1:50001\n",
+        );
+        assert_eq!(
+            parse_lsof_pcn(output),
+            vec![40001, 50001, 40000, 50000],
+            "both HTTP listeners must precede both TLS listeners"
+        );
+    }
+
     #[test]
     fn lsof_parser_matches_the_capitalised_macos_app_name() {
         let output = "p900\ncAntigravity\nf7\nn127.0.0.1:54321\n";
         assert_eq!(parse_lsof_pcn(output), vec![54321]);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn lsof_parser_deduplicates_and_handles_empty_output() {
         let output = "p1\ncagy\nf3\nn127.0.0.1:9000\nf4\nn127.0.0.1:9000\n";

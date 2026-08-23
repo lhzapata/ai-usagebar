@@ -9,6 +9,21 @@ Each release is also published at
 
 ## [Unreleased]
 
+### Fixed
+
+- Google Antigravity falls back to its discovered local server when
+  `ANTIGRAVITY_LS_ADDRESS` points at a port that is no longer listening, so a
+  restart onto a fresh ephemeral port no longer requires editing the variable
+  by hand. An explicit address is still probed first.
+- Google Antigravity probes each product's unencrypted JSON-RPC listener
+  before its TLS one, so polling no longer writes a TLS handshake error to the
+  language server's stderr on every cycle. With more than one Antigravity
+  product running, every JSON-RPC listener is tried before any TLS listener.
+- Google Antigravity reports the most informative failure among the probed
+  candidates rather than the last one, so an expired session or a schema drift
+  is no longer replaced in the tooltip by the generic `400` a TLS listener
+  returns for an unencrypted request.
+
 ## [1.4.0] — 2026-08-21
 
 ### Added
